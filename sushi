@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# Default values
+OUTPUT_FILE="subdomains.txt"
+VERBOSE=0
+
+# List of required dependencies
+DEPENDENCIES=("subfinder" "dnsx" "jq" "grep" "curl" "sed" "parallel" "anew")
+
+# ANSI color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+# Function to display usage
+usage() {
+    echo -e "${GREEN}[i] Usage: $0 -d <domain> [-o <output_file>] [-f <file_with_domains>] [-v] [-h]${NC}"
+    echo
+    echo -e "${GREEN}[i] Options:${NC}"
+    echo -e "  ${GREEN}-d <domain>${NC}           Specify the domain to enumerate subdomains."
+    echo -e "  ${GREEN}-o <output_file>${NC}      Specify the output file to save results (default: subdomains.txt)."
+    echo -e "  ${GREEN}-f <file_with_domains>${NC}Specify a file with a list of domains to process."
+    echo -e "  ${GREEN}-v${NC}                    Enable verbose output for detailed process information."
+    echo -e "  ${GREEN}-h${NC}                    Display this help menu."
+    exit 0
+}
+
+# Function to log messages if verbose is enabled
+log() {
+    if [ "$VERBOSE" -eq 1 ]; then
+        echo -e "${GREEN}[i] $1${NC}"
+    fi
+}
+
+# Function to check dependencies
+check_dependencies() {
+    local missing=()
+    for dep in "${DEPENDENCIES[@]}"; do
+        if ! command -v $dep &> /dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [ ${#missing[@]} -ne 0 ]; then
+        echo -e "${RED}[x] The following dependencies are missing:${NC}"
+        for dep in "${missing[@]}"; do
+            echo -e "  ${RED}- $dep${NC}"
+        done
+        echo
+        read -p "Would you like to install the missing dependencies? (y/n): " install_choice
+        if [[ "$install_choice" == "y" || "$install_choice" == "Y" ]]; then
+            echo -e "${GREEN}[i] Installing missing dependencies...${NC}"
+            for dep in "${missing[@]}"; do
+                case $dep in
+                    subfinder)
+                        go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+                        ;;
+                    dnsx)
+                        go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+                        ;;
+                    anew)
+                        go install -v github.com/tomnomnom/anew@latest
+                        ;;
+                    *)
+                        sudo apt-get install -y $dep || sudo yum install -y $dep || brew install $dep
+                        ;;
+                esac
+            done
+        else
+            echo -e "${RED}[x] Please install the missing dependencies manually.${NC}"
+            exit 1
+        fi
+    fi
+}
+
+# Parse command-line arguments
+while getopts "d:o:f:vh" opt; do
+    case ${opt} in
+        d)
+            DOMAIN=${OPTARG}
+            ;;
+        o)
+            OUTPUT_FILE=${OPTARG}
+            ;;
+        f)
+            DOMAIN_FILE=${OPTARG}
+            ;;
+        v)
+            VERBOSE=1
+            ;;
+        h)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+# Ensure either DOMAIN or DOMAIN_FILE is provided
+if [ -z "$DOMAIN" ] && [ -z "$DOMAIN_FILE" ]; then
+    usage
+fi
+
+# Check for dependencies
+check_dependencies
+
+# Create or empty the output file
+> $OUTPUT_FILE
+
+# Define a function to run a command and append the output using anew
+run_command() {
+    local CMD=$1
+    log "Running command: $CMD"
+    eval $CMD | anew $OUTPUT_FILE
+}
+
+# Define a function to process a domain
+process_domain() {
+    local DOMAIN=$1
+    log "Processing domain: $DOMAIN"
+    
+    local commands=(
+        "subfinder -d $DOMAIN -silent | dnsx -silent | cut -d ' ' -f1 | grep --color 'api\|dev\|stg\|test\|admin\|demo\|stage\|pre\|vpn'"
+        "curl -s https://dns.bufferover.run/dns?q=.$DOMAIN | jq -r .FDNS_A[] | cut -d',' -f2 | sort -u"
+        "curl -s \"https://riddler.io/search/exportcsv?q=pld:$DOMAIN\" | grep -Po \"(([\w.-]*)\.([\w]*)\.([A-z]))\w+\" | sort -u"
+        "curl -s \"https://api.certspotter.com/v1/issuances?domain=$DOMAIN&include_subdomains=true&expand=dns_names\" | jq .[].dns_names | grep -Po \"(([\w.-]*)\.([\w]*)\.([A-z]))\w+\" | sort -u"
+        "curl -s \"http://web.archive.org/cdx/search/cdx?url=*.$DOMAIN/*&output=text&fl=original&collapse=urlkey\" | sed -e 's_https*://__' -e \"s/\/.*//\" | sort -u"
+        "curl -s \"https://jldc.me/anubis/subdomains/$DOMAIN\" | grep -Po \"((http|https):\/\/)?(([\w.-]*)\.([\w]*)\.([A-z]))\w+\" | sort -u"
+        "curl -s \"https://crt.sh/?q=%25.$DOMAIN&output=json\" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u"
+        "curl -s \"https://api.threatminer.org/v2/domain.php?q=$DOMAIN&rt=5\" | jq -r '.results[]' |grep -o \"\w.*$DOMAIN\" | sort -u"
+        "curl -s \"https://jldc.me/anubis/subdomains/$DOMAIN\" | jq -r '.' | grep -o \"\w.*$DOMAIN\""
+        "curl -s \"https://www.threatcrowd.org/searchApi/v2/domain/report/?domain=$DOMAIN\" | jq -r '.subdomains' | grep -o \"\w.*$DOMAIN\""
+        "curl -s \"https://api.hackertarget.com/hostsearch/?q=$DOMAIN\""
+        "curl -s \"https://otx.alienvault.com/api/v1/indicators/domain/$DOMAIN/url_list?limit=100&page=1\" | grep -o '\"hostname\": *\"[^\"]*' | sed 's/\"hostname\": \"//' | sort -u"
+        "curl \"https://api.subdomain.center/?domain=$DOMAIN\" | jq -r '.[]' | sort -u"
+    )
+
+    # Export the run_command function and the OUTPUT_FILE variable for parallel to use
+    export -f run_command
+    export OUTPUT_FILE
+    export VERBOSE
+
+    # Run commands in parallel
+    printf "%s\n" "${commands[@]}" | parallel -j 5 run_command
+}
+
+# If a domain file is provided, process each domain in the file
+if [ -n "$DOMAIN_FILE" ]; then
+    log "Reading domains from file: $DOMAIN_FILE"
+    while IFS= read -r domain; do
+        process_domain "$domain"
+    done < "$DOMAIN_FILE"
+else
+    # Otherwise, process the single domain
+    process_domain "$DOMAIN"
+fi
+
+echo -e "${GREEN}[i] Subdomain enumeration completed. Results are saved in $OUTPUT_FILE${NC}"
