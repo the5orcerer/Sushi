@@ -28,7 +28,7 @@ usage() {
 # Function to log messages if verbose is enabled
 log() {
     if [ "$VERBOSE" -eq 1 ]; then
-        echo -e "${GREEN}[i] $1${NC}"
+        echo -e "${NC}[i] $1${NC}"
     fi
 }
 
